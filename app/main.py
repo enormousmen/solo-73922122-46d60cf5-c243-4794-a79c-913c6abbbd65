@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Response
 
-from .logic import evaluate_finish, evaluate_permit_request
+from .logic import analyze_restarts, evaluate_finish, evaluate_permit_request
 from .manifest import load_manifest
 from .models import PermitRecord, now_utc, to_iso
 from .schemas import LivenessBatchIn, PermitRequestIn
@@ -169,7 +170,54 @@ def create_app(db_path: str, manifest_path: str) -> FastAPI:
             store.mark_finished(request_id, now_utc())
             return permit_view(store.get_permit(request_id))
 
+    # ---- 重启核查（只读） ----
+
+    @app.get("/nodes/{node_id}/restart-audit")
+    def restart_audit(
+        node_id: str,
+        start: datetime = Query(description="核查起点 UTC（含），ISO8601"),
+        end: datetime = Query(description="核查终点 UTC（不含），ISO8601"),
+    ):
+        if node_id not in manifest.nodes:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "unknown_nodes", "unknown_nodes": [node_id]},
+            )
+        # 不带时区按 UTC 处理，统一归一到 UTC
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        start = start.astimezone(timezone.utc)
+        end = end.astimezone(timezone.utc)
+        if start >= end:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_time_window",
+                    "message": "start 必须早于 end（窗口为 [start, end)）",
+                    "start": to_iso(start),
+                    "end": to_iso(end),
+                },
+            )
+
+        # 探活与许可取自同一已提交快照；核查期间上报与许可操作照常受理
+        series, permits = store.node_series_snapshot(node_id)
+        result = analyze_restarts(node_id, start, end, series, permits)
+        return _stringify_datetimes(result)
+
     return app
+
+
+def _stringify_datetimes(obj):
+    """递归把结果中的 datetime 转为 ISO8601 字符串（UTC）。"""
+    if isinstance(obj, datetime):
+        return to_iso(obj)
+    if isinstance(obj, dict):
+        return {k: _stringify_datetimes(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_stringify_datetimes(v) for v in obj]
+    return obj
 
 
 def create_app_from_env() -> FastAPI:

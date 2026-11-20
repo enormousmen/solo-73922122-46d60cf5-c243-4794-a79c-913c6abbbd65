@@ -110,6 +110,53 @@ class Store:
             for r in rows
         }
 
+    def node_series_snapshot(
+        self, node_id: str
+    ) -> tuple[list[LatestReport], list[PermitRecord]]:
+        """同一读事务内取某节点的去重探活序列与全部许可。
+
+        两条 SELECT 在同一个延迟事务里执行，看到的是同一已提交快照，
+        即使期间有探活上报/许可操作继续写入，也不会读到新旧混合的状态。
+        探活序列按采样时间升序；同一采样时刻只保留后入库（id 最大）的一条。
+        """
+        with self._lock:
+            self._conn.execute("BEGIN")  # 延迟读事务：首次读时建立快照
+            try:
+                rows = self._conn.execute(
+                    """
+                    SELECT node_id, sampled_at, healthy, boot_id
+                    FROM (
+                        SELECT node_id, sampled_at, healthy, boot_id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY node_id, sampled_at
+                                   ORDER BY id DESC
+                               ) AS rn
+                        FROM liveness_reports
+                        WHERE node_id = ?
+                    ) t
+                    WHERE rn = 1
+                    ORDER BY sampled_at ASC
+                    """,
+                    (node_id,),
+                ).fetchall()
+                permit_rows = self._conn.execute(
+                    "SELECT * FROM permits ORDER BY approved_at, request_id"
+                ).fetchall()
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._conn.execute("COMMIT")
+        reports = [
+            LatestReport(
+                node_id=r["node_id"],
+                sampled_at=parse_iso(r["sampled_at"]),
+                healthy=bool(r["healthy"]),
+                boot_id=r["boot_id"],
+            )
+            for r in rows
+        ]
+        return reports, [self._row_to_permit(r) for r in permit_rows]
+
     # ---- 许可 ----
 
     @staticmethod
